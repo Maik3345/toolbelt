@@ -1,16 +1,15 @@
 import { Builder, Change } from '@vtex/api'
 import chalk from 'chalk'
+import {execSync} from 'child-process-es6-promise'
 import * as chokidar from 'chokidar'
 import * as debounce from 'debounce'
-import { readFileSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync } from 'fs'
 import * as moment from 'moment'
 import { join, resolve as resolvePath, sep} from 'path'
-import { concat, map, pipe, toPairs } from 'ramda'
+import { concat, forEachObjIndexed, map, pipe, toPairs } from 'ramda'
 import { createInterface } from 'readline'
-import lint from './lint'
-
 import { createClients } from '../../clients'
-import { getAccount, getWorkspace } from '../../conf'
+import { getAccount, getEnvironment, getWorkspace } from '../../conf'
 import { CommandError } from '../../errors'
 import { getMostAvailableHost } from '../../host'
 import { toAppLocator } from '../../locator'
@@ -21,6 +20,7 @@ import { formatNano } from '../utils'
 import startDebuggerTunnel from './debugger'
 import { createLinkConfig, getIgnoredPaths, getLinkedDepsDirs, getLinkedFiles, listLocalFiles } from './file'
 import legacyLink from './legacyLink'
+import lint from './lint'
 import { pathToFileObject, validateAppAction } from './utils'
 
 const root = process.cwd()
@@ -29,7 +29,38 @@ const UPDATE_SIGN = chalk.blue('U')
 const stabilityThreshold = process.platform === 'darwin' ? 100 : 200
 const AVAILABILITY_TIMEOUT = 1000
 const N_HOSTS = 3
+const reactPackageJsonPath = resolvePath(process.cwd(), 'react/package.json')
+const yarn = join(__dirname, '../../../node_modules/yarn/bin/yarn.js install --force')
 
+const assetServerTypingsBaseURL = (account: string, workspace: string, environment: string): string => {
+  let extension = 'myvtexdev'
+  if (environment === 'prod') {
+    extension = 'myvtex'
+  }
+  return `https://${workspace}--${account}.${extension}.com/_v/public/typings/v1`
+}
+
+const getReactTypings = (manifest: Manifest, account: string, workspace: string, environment: string): void => {
+  if (existsSync(reactPackageJsonPath)) {
+  const appDependencies = manifest.dependencies
+    if (appDependencies) {
+      log.info('Exporting app dependencies to react/package.json')
+      const assetServerBaseURL = assetServerTypingsBaseURL(account, workspace, environment)
+      const reactPackageJson = JSON.parse(readFileSync(reactPackageJsonPath, 'utf8'))
+      forEachObjIndexed(
+        (version, appName) => {
+          reactPackageJson.devDependencies[appName] = `${assetServerBaseURL}/${appName}@${version}/react`},
+        appDependencies
+      )
+      writeFileSync(reactPackageJsonPath, JSON.stringify(reactPackageJson, null, 2))
+      log.info('Running yarn in react/')
+      process.chdir('./react')
+      execSync(yarn, {stdio: 'inherit'})
+      process.chdir('../')
+      log.info('Finished running yarn')
+    }
+  }
+}
 
 const warnAndLinkFromStart = (appId: string, builder: Builder, extraData: { linkConfig: LinkConfig } = { linkConfig: null }) => {
   log.warn('Initial link requested by builder')
@@ -63,7 +94,7 @@ const watchAndSendChanges = async (appId: string, builder: Builder, extraData : 
   }, 300)
 
   const pathToChange = (path: string, remove?: boolean): Change => ({
-    content: remove ? null : readFileSync(resolvePath(root, path)).toString('base64'), path : pathModifier(path)
+    content: remove ? null : readFileSync(resolvePath(root, path)).toString('base64'), path : pathModifier(path),
   })
 
   const moduleAndMetadata = toPairs(extraData.linkConfig.metadata)
@@ -115,7 +146,7 @@ const watchAndSendChanges = async (appId: string, builder: Builder, extraData : 
 const performInitialLink = async (appId: string, builder: Builder, extraData : {linkConfig : LinkConfig}): Promise<void> => {
   const [linkConfig , stickyHint] = await Promise.all([
     createLinkConfig(root),
-    getMostAvailableHost(appId, builder, N_HOSTS, AVAILABILITY_TIMEOUT)
+    getMostAvailableHost(appId, builder, N_HOSTS, AVAILABILITY_TIMEOUT),
   ])
 
   const linkOptions = { sticky: true, stickyHint }
@@ -133,7 +164,7 @@ const performInitialLink = async (appId: string, builder: Builder, extraData : {
   const [localFiles, linkedFiles] =
     await Promise.all([
       listLocalFiles(root).then(paths => map(pathToFileObject(root), paths)),
-      getLinkedFiles(linkConfig)
+      getLinkedFiles(linkConfig),
     ])
   const filesWithContent = concat(localFiles, linkedFiles) as BatchStream[]
 
@@ -174,7 +205,8 @@ export default async (options) => {
   }
 
   const appId = toAppLocator(manifest)
-  const context = { account: getAccount(), workspace: getWorkspace() }
+  const context = { account: getAccount(), workspace: getWorkspace(), environment: getEnvironment() }
+  getReactTypings(manifest, context.account, context.workspace, context.environment)
   const { builder } = createClients(context, { timeout: 60000 })
 
   if (options.c || options.clean) {
